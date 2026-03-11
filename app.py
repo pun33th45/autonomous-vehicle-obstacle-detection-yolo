@@ -556,14 +556,14 @@ def tab_image_detection(model, cfg: Dict) -> None:
         col_orig, col_det = st.columns(2)
         with col_orig:
             st.markdown("##### Original")
-            st.image(bgr_to_rgb(img_bgr), use_container_width=True)
+            st.image(bgr_to_rgb(img_bgr), use_column_width=True)
         with col_det:
             st.markdown(f"##### Detected — {len(dets)} obstacle(s)")
-            st.image(bgr_to_rgb(annotated_bgr), use_container_width=True)
+            st.image(bgr_to_rgb(annotated_bgr), use_column_width=True)
     else:
         st.image(bgr_to_rgb(annotated_bgr),
                  caption=f"Detected: {len(dets)} obstacle(s)",
-                 use_container_width=True)
+                 use_column_width=True)
 
     if download_result:
         _, buf = cv2.imencode(".png", annotated_bgr)
@@ -704,7 +704,7 @@ def _process_and_display_video(uploaded_video, model, cfg, frame_skip, max_frame
                     )
                     preview_slot.image(bgr_to_rgb(annotated),
                                        caption=f"Frame {frame_idx}",
-                                       use_container_width=True)
+                                       use_column_width=True)
 
                 del annotated, dets
                 gc.collect()
@@ -815,7 +815,7 @@ def tab_webcam_detection(model, cfg: Dict) -> None:
 
             frame_slot.image(bgr_to_rgb(annotated),
                              caption=f"Frame {frame_num} | {len(dets_filtered)} detection(s)",
-                             use_container_width=True)
+                             use_column_width=True)
 
             with metrics_slot.container():
                 m1, m2, m3 = st.columns(3)
