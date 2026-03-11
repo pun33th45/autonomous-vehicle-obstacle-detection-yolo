@@ -1,6 +1,6 @@
 # ============================================================
 # Streamlit frontend — CPU-only, Python 3.11-slim (Debian bookworm)
-# For deployment on Render / any container host
+# Memory-optimised for Render free tier (~512 MB RAM)
 # ============================================================
 
 FROM python:3.11-slim
@@ -36,8 +36,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Copy project files ───────────────────────────────────────
 COPY . .
-
-# Create runtime directories (model weights, etc.)
 RUN mkdir -p models/weights
 
 # ── Expose port (Render overrides $PORT at runtime) ──────────

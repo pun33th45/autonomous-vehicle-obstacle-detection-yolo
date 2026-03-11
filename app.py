@@ -1,19 +1,18 @@
 """
 app.py
 ------
-Streamlit Interactive Dashboard for Autonomous Vehicle Obstacle Detection.
+Streamlit Dashboard for Autonomous Vehicle Obstacle Detection.
+Memory-optimised for Render free tier (~512 MB RAM).
 
 Sections:
   🖼️  Image Detection  — Upload & analyse images
   🎬  Video Detection  — Process video files
   📷  Webcam          — Real-time live detection
   📈  Analytics       — Class distribution & confidence charts
-
-Usage:
-    streamlit run app.py
 """
 
 # ─── Standard Library ────────────────────────────────────────────────────────
+import gc
 import io
 import sys
 import tempfile
@@ -27,7 +26,6 @@ warnings.filterwarnings("ignore")
 # ─── Third-Party ─────────────────────────────────────────────────────────────
 import cv2
 import numpy as np
-import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
@@ -45,8 +43,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
-        "Get Help": "https://github.com/yourusername/autonomous-obstacle-detection-yolo",
-        "Report a bug": "https://github.com/yourusername/autonomous-obstacle-detection-yolo/issues",
+        "Get Help": "https://github.com/pun33th45/autonomous-vehicle-obstacle-detection-yolo",
+        "Report a bug": "https://github.com/pun33th45/autonomous-vehicle-obstacle-detection-yolo/issues",
         "About": "YOLOv8-powered Autonomous Vehicle Obstacle Detection System",
     },
 )
@@ -88,13 +86,14 @@ CLASS_COLORS_HEX: List[str] = [
 WEIGHTS_DIR = ROOT / "models" / "weights"
 DEFAULT_WEIGHTS = WEIGHTS_DIR / "best.pt"
 
+# Maximum edge length before resizing (keeps RAM under control)
+MAX_INFER_SIZE = 640
+
 # ─── Inline CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* ── Page background ───────────────────────────────────────────── */
 .main { background-color: #0e1117; }
 
-/* ── Metric cards ──────────────────────────────────────────────── */
 [data-testid="metric-container"] {
     background: linear-gradient(135deg, #1a1f2e, #252d40);
     border: 1px solid #2d3548;
@@ -114,7 +113,6 @@ st.markdown("""
     font-weight: 700;
 }
 
-/* ── Detection box ─────────────────────────────────────────────── */
 .det-card {
     background: #1a1f2e;
     border-left: 4px solid;
@@ -123,7 +121,6 @@ st.markdown("""
     margin: 6px 0;
 }
 
-/* ── Section headers ───────────────────────────────────────────── */
 .section-header {
     background: linear-gradient(90deg, #1a237e, #283593);
     color: white;
@@ -134,13 +131,11 @@ st.markdown("""
     font-weight: 600;
 }
 
-/* ── Sidebar ───────────────────────────────────────────────────── */
 [data-testid="stSidebar"] {
     background: linear-gradient(180deg, #0d1117 0%, #161b27 100%);
     border-right: 1px solid #21262d;
 }
 
-/* ── Tabs ──────────────────────────────────────────────────────── */
 .stTabs [data-baseweb="tab"] {
     color: #8b9dc3;
     font-weight: 600;
@@ -151,7 +146,6 @@ st.markdown("""
     border-bottom: 2px solid #58a6ff !important;
 }
 
-/* ── Buttons ───────────────────────────────────────────────────── */
 .stButton>button {
     background: linear-gradient(135deg, #1565c0, #1976d2);
     color: white;
@@ -165,33 +159,24 @@ st.markdown("""
     box-shadow: 0 4px 12px rgba(21,101,192,0.4);
     transform: translateY(-1px);
 }
-
-/* ── Info / warning boxes ──────────────────────────────────────── */
-.stInfo, .stWarning, .stSuccess, .stError {
-    border-radius: 8px;
-}
 </style>
 """, unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Model Loading (cached singleton)
+#  Model Loading — cached singleton, CPU-only
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource(show_spinner="⚙️ Loading model weights…")
 def load_model(weights_path: str):
     """
-    Load a YOLO model and cache it for the session lifetime.
-
-    Args:
-        weights_path: Path to ``.pt`` weights file.
-
-    Returns:
-        Loaded :class:`ultralytics.YOLO` instance, or ``None`` on failure.
+    Load a YOLO model once and cache it for the session lifetime.
+    Always runs on CPU to stay within Render's 512 MB RAM limit.
     """
     try:
         from ultralytics import YOLO
         model = YOLO(weights_path)
+        model.to("cpu")
         return model
     except Exception as exc:
         st.error(f"❌ Failed to load model: {exc}")
@@ -202,12 +187,21 @@ def load_model(weights_path: str):
 #  Inference helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _resize_for_inference(img: np.ndarray) -> np.ndarray:
+    """Resize image so the longest edge ≤ MAX_INFER_SIZE (saves RAM)."""
+    h, w = img.shape[:2]
+    if max(h, w) > MAX_INFER_SIZE:
+        scale = MAX_INFER_SIZE / max(h, w)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)),
+                         interpolation=cv2.INTER_AREA)
+    return img
+
+
 def run_inference(
     model,
     image: np.ndarray,
     conf: float,
     iou: float,
-    device: str,
 ) -> Tuple[np.ndarray, List[Dict[str, Any]], float]:
     """
     Run YOLOv8 inference on a BGR image.
@@ -215,12 +209,15 @@ def run_inference(
     Returns:
         (annotated_image, list_of_dets, inference_ms)
     """
+    # Resize before inference to cap RAM usage
+    image = _resize_for_inference(image)
+
     t0 = time.perf_counter()
     results = model.predict(
         image,
         conf=conf,
         iou=iou,
-        device=device,
+        device="cpu",
         verbose=False,
     )
     inf_ms = (time.perf_counter() - t0) * 1000
@@ -235,13 +232,18 @@ def run_inference(
             cls_id   = int(box.cls.item())
             conf_val = float(box.conf.item())
             x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-            cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else str(cls_id)
-            color    = CLASS_COLORS_BGR[cls_id % len(CLASS_COLORS_BGR)]
 
-            # Draw bounding box
+            # Use model's own class names if available, else fall back to ours
+            if hasattr(result, "names") and result.names:
+                cls_name = result.names.get(cls_id, str(cls_id))
+            elif cls_id < len(CLASS_NAMES):
+                cls_name = CLASS_NAMES[cls_id]
+            else:
+                cls_name = str(cls_id)
+
+            color = CLASS_COLORS_BGR[cls_id % len(CLASS_COLORS_BGR)]
+
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-
-            # Label background
             label = f"{cls_name}  {conf_val:.2f}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
             cv2.rectangle(annotated, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
@@ -255,11 +257,14 @@ def run_inference(
                 "bbox":       [x1, y1, x2, y2],
             })
 
+    # Free result objects immediately
+    del results
+    gc.collect()
+
     return annotated, detections, inf_ms
 
 
 def bgr_to_rgb(img: np.ndarray) -> np.ndarray:
-    """Convert BGR OpenCV array to RGB for display."""
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
@@ -268,15 +273,13 @@ def bgr_to_rgb(img: np.ndarray) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def render_sidebar() -> Dict[str, Any]:
-    """Render sidebar controls and return configuration dict."""
     with st.sidebar:
-        # ── Logo / Title ──────────────────────────────────────────────────────
         st.markdown("""
         <div style="text-align:center; padding: 20px 0 10px;">
             <div style="font-size:3rem;">🚗</div>
             <div style="color:#58a6ff; font-size:1.1rem; font-weight:700;
                         letter-spacing:0.05em;">OBSTACLE DETECTION</div>
-            <div style="color:#6b7280; font-size:0.75rem;">Powered by YOLOv8</div>
+            <div style="color:#6b7280; font-size:0.75rem;">Powered by YOLOv8n</div>
         </div>
         <hr style="border-color:#21262d; margin:0 0 20px;"/>
         """, unsafe_allow_html=True)
@@ -284,14 +287,16 @@ def render_sidebar() -> Dict[str, Any]:
         # ── Model Settings ────────────────────────────────────────────────────
         st.markdown("### ⚙️ Model Settings")
 
+        # Nano model only on free tier — keeps RAM well under 512 MB.
+        # Custom allows pointing to a locally placed best.pt.
         model_choice = st.selectbox(
             "Model Variant",
-            options=["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x", "Custom"],
-            index=2,
-            help="Larger models are more accurate but slower.",
+            options=["yolov8n", "Custom"],
+            index=0,
+            help="yolov8n is the lightest model (~6 MB, ~120 MB RAM). "
+                 "Choose Custom to load your own trained weights.",
         )
 
-        # Custom weights path
         if model_choice == "Custom":
             custom_path = st.text_input(
                 "Weights Path",
@@ -300,13 +305,13 @@ def render_sidebar() -> Dict[str, Any]:
             )
             weights_path = custom_path
         else:
-            # Use local best.pt if available, else use pretrained
             if DEFAULT_WEIGHTS.exists():
                 weights_path = str(DEFAULT_WEIGHTS)
             else:
-                weights_path = f"{model_choice}.pt"
+                weights_path = "yolov8n.pt"
 
         st.caption(f"📂 `{Path(weights_path).name}`")
+        st.info("💻 Inference runs on **CPU** (Render free tier)", icon="ℹ️")
 
         st.divider()
 
@@ -315,46 +320,15 @@ def render_sidebar() -> Dict[str, Any]:
 
         conf_threshold = st.slider(
             "Confidence Threshold",
-            min_value=0.10,
-            max_value=0.95,
-            value=0.35,
-            step=0.05,
+            min_value=0.10, max_value=0.95, value=0.35, step=0.05,
             help="Minimum confidence score to show a detection.",
         )
 
         iou_threshold = st.slider(
             "IoU Threshold (NMS)",
-            min_value=0.10,
-            max_value=0.95,
-            value=0.45,
-            step=0.05,
+            min_value=0.10, max_value=0.95, value=0.45, step=0.05,
             help="Non-maximum suppression IoU threshold.",
         )
-
-        st.divider()
-
-        # ── Hardware ──────────────────────────────────────────────────────────
-        st.markdown("### 💻 Hardware")
-
-        try:
-            import torch
-            cuda_ok = torch.cuda.is_available()
-        except ImportError:
-            cuda_ok = False
-
-        device_options = ["CPU"]
-        if cuda_ok:
-            device_options.insert(0, "GPU (CUDA)")
-
-        device_label = st.selectbox("Inference Device", options=device_options)
-        device = "0" if "GPU" in device_label else "cpu"
-
-        if cuda_ok:
-            import torch
-            gpu_name = torch.cuda.get_device_name(0)
-            st.success(f"✅ GPU: {gpu_name}")
-        else:
-            st.info("ℹ️ Running on CPU")
 
         st.divider()
 
@@ -372,12 +346,11 @@ def render_sidebar() -> Dict[str, Any]:
 
         st.divider()
 
-        # ── About ─────────────────────────────────────────────────────────────
         st.markdown("""
         <div style="color:#6b7280; font-size:0.78rem; text-align:center;">
             <b>Autonomous Obstacle Detection</b><br/>
-            YOLOv8 · PyTorch · OpenCV<br/>
-            <a href="https://github.com/yourusername/autonomous-obstacle-detection-yolo"
+            YOLOv8n · PyTorch · OpenCV<br/>
+            <a href="https://github.com/pun33th45/autonomous-vehicle-obstacle-detection-yolo"
                style="color:#58a6ff;">GitHub ↗</a>
         </div>
         """, unsafe_allow_html=True)
@@ -386,26 +359,32 @@ def render_sidebar() -> Dict[str, Any]:
         "weights_path":     weights_path,
         "conf_threshold":   conf_threshold,
         "iou_threshold":    iou_threshold,
-        "device":           device,
         "selected_classes": selected_classes,
     }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Analytics helpers
+#  Analytics helpers — no pandas, plotly accepts plain lists/dicts
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _chart_layout() -> Dict:
+    return dict(
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font_color="#c9d1d9",
+        showlegend=False,
+        margin=dict(t=40, b=20),
+    )
+
+
 def render_detection_stats(detections: List[Dict], inf_ms: float) -> None:
-    """Render metric cards + charts for a list of detections."""
     if not detections:
         st.info("🔍 No obstacles detected above the confidence threshold.")
         return
 
-    # ── Top metrics ───────────────────────────────────────────────────────────
-    total   = len(detections)
+    total    = len(detections)
     avg_conf = sum(d["confidence"] for d in detections) / total
-    best    = max(detections, key=lambda d: d["confidence"])
-    classes = list({d["class_name"] for d in detections})
+    classes  = list({d["class_name"] for d in detections})
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("🎯 Detections", total)
@@ -417,66 +396,47 @@ def render_detection_stats(detections: List[Dict], inf_ms: float) -> None:
 
     col_chart, col_table = st.columns([3, 2])
 
-    # ── Bar chart: detections per class ──────────────────────────────────────
     with col_chart:
-        class_counts = {}
+        # Bar chart — class counts
+        class_counts: Dict[str, int] = {}
         for d in detections:
             class_counts[d["class_name"]] = class_counts.get(d["class_name"], 0) + 1
 
-        df_count = pd.DataFrame(
-            list(class_counts.items()), columns=["Class", "Count"]
-        ).sort_values("Count", ascending=False)
-
-        color_map = {name: CLASS_COLORS_HEX[i % len(CLASS_COLORS_HEX)]
-                     for i, name in enumerate(CLASS_NAMES)}
+        sorted_classes = sorted(class_counts, key=class_counts.__getitem__, reverse=True)
+        color_map = {n: CLASS_COLORS_HEX[i % len(CLASS_COLORS_HEX)]
+                     for i, n in enumerate(CLASS_NAMES)}
 
         fig_bar = px.bar(
-            df_count,
-            x="Class", y="Count",
-            color="Class",
+            x=sorted_classes,
+            y=[class_counts[c] for c in sorted_classes],
+            color=sorted_classes,
             color_discrete_map=color_map,
+            labels={"x": "Class", "y": "Count"},
             title="Detections per Class",
-            text="Count",
+            text=[class_counts[c] for c in sorted_classes],
         )
-        fig_bar.update_layout(
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            font_color="#c9d1d9",
-            showlegend=False,
-            title_font_size=14,
-            margin=dict(t=40, b=20),
-        )
+        fig_bar.update_layout(**_chart_layout())
         fig_bar.update_traces(textposition="outside", marker_line_width=0)
         fig_bar.update_xaxes(showgrid=False)
         fig_bar.update_yaxes(gridcolor="#21262d")
         st.plotly_chart(fig_bar, use_container_width=True)
 
-    # ── Confidence distribution violin ───────────────────────────────────────
-    with col_chart:
-        df_conf = pd.DataFrame([
-            {"Class": d["class_name"], "Confidence": d["confidence"]}
-            for d in detections
-        ])
+        # Box plot — confidence distribution per class
+        x_vals = [d["class_name"] for d in detections]
+        y_vals = [d["confidence"] for d in detections]
         fig_box = px.box(
-            df_conf, x="Class", y="Confidence",
-            color="Class",
+            x=x_vals, y=y_vals,
+            color=x_vals,
             color_discrete_map=color_map,
+            labels={"x": "Class", "y": "Confidence"},
             title="Confidence Score Distribution",
             points="all",
         )
-        fig_box.update_layout(
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            font_color="#c9d1d9",
-            showlegend=False,
-            title_font_size=14,
-            margin=dict(t=40, b=20),
-        )
+        fig_box.update_layout(**_chart_layout())
         fig_box.update_yaxes(range=[0, 1.05], gridcolor="#21262d")
         fig_box.update_xaxes(showgrid=False)
         st.plotly_chart(fig_box, use_container_width=True)
 
-    # ── Detection table ───────────────────────────────────────────────────────
     with col_table:
         st.markdown("#### 📋 Detection Details")
         for det in sorted(detections, key=lambda d: -d["confidence"]):
@@ -484,8 +444,6 @@ def render_detection_stats(detections: List[Dict], inf_ms: float) -> None:
             color = CLASS_COLORS_HEX[det["class_id"] % len(CLASS_COLORS_HEX)]
             conf_pct = int(det["confidence"] * 100)
             x1, y1, x2, y2 = det["bbox"]
-            w = x2 - x1
-            h = y2 - y1
             st.markdown(
                 f"""<div class="det-card" style="border-left-color:{color};">
                     <span style="font-size:1.2rem;">{icon}</span>
@@ -495,7 +453,7 @@ def render_detection_stats(detections: List[Dict], inf_ms: float) -> None:
                     <br/>
                     <span style="color:#8b9dc3; font-size:0.82rem;">
                         Conf: <b style="color:#e0e6f0;">{conf_pct}%</b>&nbsp;&nbsp;
-                        Size: <b style="color:#e0e6f0;">{w}×{h}px</b>
+                        Size: <b style="color:#e0e6f0;">{x2-x1}×{y2-y1}px</b>
                     </span>
                 </div>""",
                 unsafe_allow_html=True,
@@ -516,18 +474,16 @@ def tab_image_detection(model, cfg: Dict) -> None:
 
     with col_options:
         st.markdown("#### Options")
-        show_original = st.checkbox("Show original side-by-side", value=True)
-        download_result = st.checkbox("Enable result download", value=True)
+        show_original    = st.checkbox("Show original side-by-side", value=True)
+        download_result  = st.checkbox("Enable result download", value=True)
 
     with col_upload:
         uploaded = st.file_uploader(
             "Upload an image",
             type=["jpg", "jpeg", "png", "bmp", "webp"],
-            help="Supported formats: JPG, JPEG, PNG, BMP, WEBP",
             label_visibility="collapsed",
         )
 
-    # ── Demo images if nothing uploaded ───────────────────────────────────────
     if uploaded is None:
         st.markdown("""
         <div style="border:2px dashed #21262d; border-radius:12px;
@@ -536,9 +492,7 @@ def tab_image_detection(model, cfg: Dict) -> None:
             <div style="font-size:1.1rem; margin:10px 0;">
                 Upload an image to detect road obstacles
             </div>
-            <div style="font-size:0.85rem;">
-                Supports JPG · PNG · BMP · WEBP
-            </div>
+            <div style="font-size:0.85rem;">Supports JPG · PNG · BMP · WEBP</div>
         </div>
         """, unsafe_allow_html=True)
         return
@@ -547,26 +501,23 @@ def tab_image_detection(model, cfg: Dict) -> None:
         st.error("❌ Model not loaded. Check the weights path in the sidebar.")
         return
 
-    # ── Decode ────────────────────────────────────────────────────────────────
     file_bytes = np.frombuffer(uploaded.read(), dtype=np.uint8)
     img_bgr    = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     if img_bgr is None:
         st.error("❌ Could not decode image.")
         return
 
-    h, w = img_bgr.shape[:2]
-
-    # ── Run Detection ─────────────────────────────────────────────────────────
     with st.spinner("🔍 Running detection…"):
         annotated_bgr, dets, inf_ms = run_inference(
-            model, img_bgr, cfg["conf_threshold"],
-            cfg["iou_threshold"], cfg["device"],
+            model, img_bgr, cfg["conf_threshold"], cfg["iou_threshold"],
         )
 
-    # Filter by selected classes
+    # Free original before displaying
+    del file_bytes
+    gc.collect()
+
     dets = [d for d in dets if d["class_name"] in cfg["selected_classes"]]
 
-    # ── Display images ────────────────────────────────────────────────────────
     if show_original:
         col_orig, col_det = st.columns(2)
         with col_orig:
@@ -580,7 +531,6 @@ def tab_image_detection(model, cfg: Dict) -> None:
                  caption=f"Detected: {len(dets)} obstacle(s)",
                  use_container_width=True)
 
-    # ── Download ──────────────────────────────────────────────────────────────
     if download_result:
         _, buf = cv2.imencode(".png", annotated_bgr)
         st.download_button(
@@ -590,7 +540,9 @@ def tab_image_detection(model, cfg: Dict) -> None:
             mime="image/png",
         )
 
-    # ── Stats ─────────────────────────────────────────────────────────────────
+    del img_bgr, annotated_bgr
+    gc.collect()
+
     st.divider()
     st.markdown("### 📊 Detection Analytics")
     render_detection_stats(dets, inf_ms)
@@ -611,14 +563,12 @@ def tab_video_detection(model, cfg: Dict) -> None:
     with col_opt:
         st.markdown("#### Options")
         frame_skip = st.slider(
-            "Frame Skip",
-            min_value=1, max_value=10, value=1,
-            help="Process every N-th frame (higher = faster).",
+            "Frame Skip", min_value=1, max_value=10, value=2,
+            help="Process every N-th frame (higher = faster, less RAM).",
         )
         max_frames = st.number_input(
-            "Max Frames",
-            min_value=10, max_value=2000, value=300,
-            help="Maximum frames to process.",
+            "Max Frames", min_value=10, max_value=500, value=150,
+            help="Cap frames to process (keeps memory bounded).",
         )
 
     with col_up:
@@ -636,9 +586,7 @@ def tab_video_detection(model, cfg: Dict) -> None:
             <div style="font-size:1.1rem; margin:10px 0;">
                 Upload a video to detect obstacles frame by frame
             </div>
-            <div style="font-size:0.85rem;">
-                Supports MP4 · AVI · MOV · MKV
-            </div>
+            <div style="font-size:0.85rem;">Supports MP4 · AVI · MOV · MKV</div>
         </div>
         """, unsafe_allow_html=True)
         return
@@ -648,20 +596,10 @@ def tab_video_detection(model, cfg: Dict) -> None:
         return
 
     if st.button("▶️  Process Video", type="primary", use_container_width=True):
-        _process_and_display_video(
-            uploaded_video, model, cfg, frame_skip, max_frames
-        )
+        _process_and_display_video(uploaded_video, model, cfg, frame_skip, int(max_frames))
 
 
-def _process_and_display_video(
-    uploaded_video,
-    model,
-    cfg: Dict,
-    frame_skip: int,
-    max_frames: int,
-) -> None:
-    """Process video and display results."""
-    # Save to temp file
+def _process_and_display_video(uploaded_video, model, cfg, frame_skip, max_frames):
     with tempfile.NamedTemporaryFile(
         suffix=Path(uploaded_video.name).suffix, delete=False
     ) as tmp:
@@ -674,30 +612,32 @@ def _process_and_display_video(
         tmp_path.unlink(missing_ok=True)
         return
 
-    total_frames  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    src_fps       = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    width         = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    src_fps      = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Clamp output size to MAX_INFER_SIZE to save disk + RAM
+    scale = min(1.0, MAX_INFER_SIZE / max(width, height, 1))
+    out_w, out_h = int(width * scale), int(height * scale)
 
     st.info(
-        f"📹 Video: **{uploaded_video.name}** | "
-        f"{width}×{height} | {src_fps:.0f} FPS | {total_frames} frames"
+        f"📹 **{uploaded_video.name}** | {width}×{height} → {out_w}×{out_h} "
+        f"| {src_fps:.0f} FPS | {total_frames} frames"
     )
 
-    # Output video
     out_path = tmp_path.with_name("output.mp4")
     fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
-    writer   = cv2.VideoWriter(str(out_path), fourcc, src_fps, (width, height))
+    writer   = cv2.VideoWriter(str(out_path), fourcc, src_fps, (out_w, out_h))
 
-    # Progress tracking
     progress_bar = st.progress(0, text="Processing frames…")
     status_text  = st.empty()
     preview_slot = st.empty()
 
-    all_dets:   List[Dict] = []
-    fps_times:  List[float] = []
-    processed   = 0
-    frame_idx   = 0
+    all_dets:  List[Dict] = []
+    fps_times: List[float] = []
+    processed  = 0
+    frame_idx  = 0
     frames_to_process = min(max_frames, total_frames)
 
     try:
@@ -709,42 +649,34 @@ def _process_and_display_video(
             if frame_idx % max(1, frame_skip) == 0:
                 t0 = time.perf_counter()
                 annotated, dets, _ = run_inference(
-                    model, frame,
-                    cfg["conf_threshold"], cfg["iou_threshold"], cfg["device"],
+                    model, frame, cfg["conf_threshold"], cfg["iou_threshold"],
                 )
                 fps_times.append(time.perf_counter() - t0)
 
-                # FPS overlay
                 fps_val = 1.0 / (fps_times[-1] + 1e-9)
-                cv2.putText(
-                    annotated, f"FPS: {fps_val:.1f}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2,
-                )
+                cv2.putText(annotated, f"FPS: {fps_val:.1f}",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
                 writer.write(annotated)
-                dets_filtered = [
-                    d for d in dets if d["class_name"] in cfg["selected_classes"]
-                ]
+                dets_filtered = [d for d in dets if d["class_name"] in cfg["selected_classes"]]
                 all_dets.extend(dets_filtered)
                 processed += 1
 
-                # Update UI every 10 frames
                 if processed % 10 == 0:
                     pct = processed / frames_to_process
-                    progress_bar.progress(
-                        pct, text=f"Processing… {processed}/{frames_to_process} frames"
-                    )
+                    progress_bar.progress(pct, text=f"Processing… {processed}/{frames_to_process}")
                     status_text.markdown(
-                        f"**Frame {frame_idx}** | Detections: {len(dets_filtered)} | "
-                        f"Total: {len(all_dets)}"
+                        f"**Frame {frame_idx}** | Detections: {len(dets_filtered)} | Total: {len(all_dets)}"
                     )
-                    preview_slot.image(
-                        bgr_to_rgb(annotated),
-                        caption=f"Frame {frame_idx}",
-                        use_container_width=True,
-                    )
+                    preview_slot.image(bgr_to_rgb(annotated),
+                                       caption=f"Frame {frame_idx}",
+                                       use_container_width=True)
+
+                del annotated, dets
+                gc.collect()
             else:
-                writer.write(frame)
+                # Write resized frame for skipped frames
+                writer.write(cv2.resize(frame, (out_w, out_h)))
 
             frame_idx += 1
 
@@ -756,8 +688,7 @@ def _process_and_display_video(
     progress_bar.progress(1.0, text="✅ Processing complete!")
     status_text.empty()
 
-    # ── Summary metrics ────────────────────────────────────────────────────────
-    avg_ms = sum(fps_times) / max(1, len(fps_times)) * 1000
+    avg_ms  = sum(fps_times) / max(1, len(fps_times)) * 1000
     avg_fps = 1000 / avg_ms if avg_ms > 0 else 0
 
     st.success(
@@ -766,7 +697,6 @@ def _process_and_display_video(
         f"Total detections: **{len(all_dets)}**"
     )
 
-    # Download output video
     if out_path.exists():
         with open(out_path, "rb") as f:
             st.download_button(
@@ -777,7 +707,6 @@ def _process_and_display_video(
             )
         out_path.unlink(missing_ok=True)
 
-    # Stats
     if all_dets:
         st.divider()
         st.markdown("### 📊 Video Detection Analytics")
@@ -797,20 +726,10 @@ def tab_webcam_detection(model, cfg: Dict) -> None:
     col_ctrl, col_info = st.columns([1, 2])
 
     with col_ctrl:
-        camera_index = st.number_input(
-            "Camera Index", min_value=0, max_value=10, value=0,
-            help="0 = default webcam, 1 = secondary camera, etc.",
-        )
-        max_webcam_frames = st.slider(
-            "Capture Frames",
-            min_value=10, max_value=500, value=100,
-            help="Number of frames to capture before stopping.",
-        )
-        run_webcam = st.button(
-            "📷  Start Webcam Detection",
-            type="primary",
-            use_container_width=True,
-        )
+        camera_index       = st.number_input("Camera Index", min_value=0, max_value=10, value=0)
+        max_webcam_frames  = st.slider("Capture Frames", min_value=10, max_value=300, value=60)
+        run_webcam         = st.button("📷  Start Webcam Detection", type="primary",
+                                       use_container_width=True)
 
     with col_info:
         st.info("""
@@ -818,30 +737,21 @@ def tab_webcam_detection(model, cfg: Dict) -> None:
         1. Select your camera index (0 for default)
         2. Set the number of frames to capture
         3. Click **Start Webcam Detection**
-        4. The app will capture and process frames in real time
 
         > ⚠️ Webcam access requires a local browser session.
-        > For cloud deployments, use Image or Video mode instead.
+        > On Render / cloud deployments use Image or Video mode instead.
         """)
 
-    if not run_webcam:
-        return
-
-    if model is None:
-        st.error("❌ Model not loaded.")
+    if not run_webcam or model is None:
         return
 
     cap = cv2.VideoCapture(int(camera_index))
     if not cap.isOpened():
-        st.error(
-            f"❌ Cannot open camera (index {camera_index}). "
-            "Check that your camera is connected and accessible."
-        )
+        st.error(f"❌ Cannot open camera (index {camera_index}).")
         return
 
     st.success(f"✅ Camera opened (index {camera_index})")
 
-    # UI placeholders
     frame_slot   = st.empty()
     metrics_slot = st.empty()
     stop_btn     = st.button("⏹ Stop", key="stop_webcam")
@@ -854,63 +764,52 @@ def tab_webcam_detection(model, cfg: Dict) -> None:
         while frame_num < max_webcam_frames and not stop_btn:
             ret, frame = cap.read()
             if not ret:
-                st.warning("⚠️ Failed to capture frame.")
                 break
 
             t0 = time.perf_counter()
             annotated, dets, inf_ms = run_inference(
-                model, frame,
-                cfg["conf_threshold"], cfg["iou_threshold"], cfg["device"],
+                model, frame, cfg["conf_threshold"], cfg["iou_threshold"],
             )
             fps_times.append(time.perf_counter() - t0)
             fps_val = 1.0 / (fps_times[-1] + 1e-9)
 
-            dets_filtered = [
-                d for d in dets if d["class_name"] in cfg["selected_classes"]
-            ]
+            dets_filtered = [d for d in dets if d["class_name"] in cfg["selected_classes"]]
             all_dets.extend(dets_filtered)
 
-            # FPS overlay
-            cv2.putText(
-                annotated, f"FPS: {fps_val:.1f}  Frame: {frame_num}",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
-            )
+            cv2.putText(annotated, f"FPS: {fps_val:.1f}  Frame: {frame_num}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-            # Show frame
-            frame_slot.image(
-                bgr_to_rgb(annotated),
-                caption=f"Frame {frame_num} | {len(dets_filtered)} detection(s)",
-                use_container_width=True,
-            )
+            frame_slot.image(bgr_to_rgb(annotated),
+                             caption=f"Frame {frame_num} | {len(dets_filtered)} detection(s)",
+                             use_container_width=True)
 
-            # Live metrics
             with metrics_slot.container():
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Frame", frame_num)
                 m2.metric("FPS", f"{fps_val:.1f}")
                 m3.metric("Detections", len(dets_filtered))
 
+            del annotated, dets
+            gc.collect()
             frame_num += 1
 
     finally:
         cap.release()
 
-    # Summary
     avg_fps = len(fps_times) / (sum(fps_times) + 1e-9)
     st.success(
-        f"✅ Webcam session ended | Frames: **{frame_num}** | "
+        f"✅ Session ended | Frames: **{frame_num}** | "
         f"Avg FPS: **{avg_fps:.1f}** | Total detections: **{len(all_dets)}**"
     )
 
     if all_dets:
         st.divider()
-        st.markdown("### 📊 Webcam Session Analytics")
         avg_ms = sum(fps_times) / max(1, len(fps_times)) * 1000
         render_detection_stats(all_dets, avg_ms)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Tab 4 — Analytics
+#  Tab 4 — Analytics (static benchmarks, no pandas required)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def tab_analytics(cfg: Dict) -> None:
@@ -919,56 +818,46 @@ def tab_analytics(cfg: Dict) -> None:
         unsafe_allow_html=True,
     )
 
-    # ── Model comparison ──────────────────────────────────────────────────────
+    # ── YOLOv8 variant comparison ─────────────────────────────────────────────
     st.markdown("#### 🤖 YOLOv8 Variant Comparison")
 
-    benchmark_data = {
-        "Variant":       ["YOLOv8n", "YOLOv8s", "YOLOv8m", "YOLOv8l", "YOLOv8x"],
-        "Parameters (M)":  [3.2, 11.2, 25.9, 43.7, 68.2],
-        "FPS (GPU)":        [310, 200, 142, 95, 68],
-        "mAP@50":           [0.65, 0.70, 0.74, 0.76, 0.78],
-        "Latency (ms)":     [3.2, 5.0, 7.0, 10.5, 14.7],
-    }
-    df_bench = pd.DataFrame(benchmark_data)
+    variants   = ["YOLOv8n", "YOLOv8s", "YOLOv8m", "YOLOv8l", "YOLOv8x"]
+    params     = [3.2, 11.2, 25.9, 43.7, 68.2]
+    fps_vals   = [310, 200, 142, 95, 68]
+    map_vals   = [0.65, 0.70, 0.74, 0.76, 0.78]
+    lat_vals   = [3.2, 5.0, 7.0, 10.5, 14.7]
 
     col_a, col_b = st.columns(2)
 
     with col_a:
         fig_fps = px.bar(
-            df_bench, x="Variant", y="FPS (GPU)",
-            color="Variant", text="FPS (GPU)",
+            x=variants, y=fps_vals, color=variants, text=fps_vals,
             title="Inference Speed (FPS)",
+            labels={"x": "Variant", "y": "FPS (GPU)"},
             color_discrete_sequence=px.colors.sequential.Blues_r,
         )
-        fig_fps.update_layout(
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-            font_color="#c9d1d9", showlegend=False, margin=dict(t=40, b=20),
-        )
+        fig_fps.update_layout(**_chart_layout())
         fig_fps.update_traces(textposition="outside")
         st.plotly_chart(fig_fps, use_container_width=True)
 
     with col_b:
         fig_map = px.bar(
-            df_bench, x="Variant", y="mAP@50",
-            color="Variant", text="mAP@50",
+            x=variants, y=map_vals, color=variants, text=map_vals,
             title="mAP@50 Score",
+            labels={"x": "Variant", "y": "mAP@50"},
             color_discrete_sequence=px.colors.sequential.Greens_r,
         )
-        fig_map.update_layout(
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-            font_color="#c9d1d9", showlegend=False, margin=dict(t=40, b=20),
-        )
+        fig_map.update_layout(**_chart_layout())
         fig_map.update_traces(textfont_size=11, textposition="outside")
         fig_map.update_yaxes(range=[0, 0.95])
         st.plotly_chart(fig_map, use_container_width=True)
 
-    # ── Scatter: FPS vs mAP ───────────────────────────────────────────────────
     fig_scatter = px.scatter(
-        df_bench, x="mAP@50", y="FPS (GPU)",
-        size="Parameters (M)", color="Variant",
-        hover_name="Variant",
-        text="Variant",
+        x=map_vals, y=fps_vals,
+        size=params, color=variants, text=variants,
+        hover_name=variants,
         title="Speed vs Accuracy Trade-off (bubble size = model parameters)",
+        labels={"x": "mAP@50", "y": "FPS (GPU)"},
         size_max=50,
     )
     fig_scatter.update_layout(
@@ -981,62 +870,51 @@ def tab_analytics(cfg: Dict) -> None:
     # ── Deployment benchmark ──────────────────────────────────────────────────
     st.markdown("#### ⚡ Export Format Benchmark (YOLOv8m)")
 
-    deploy_data = {
-        "Format":       ["PyTorch FP32", "PyTorch FP16", "ONNX FP32", "ONNX FP16", "TensorRT FP16"],
-        "FPS":          [85, 142, 95, 160, 310],
-        "Latency (ms)": [11.8, 7.0, 10.5, 6.2, 3.2],
-        "mAP@50":       [0.72, 0.72, 0.72, 0.72, 0.71],
-    }
-    df_deploy = pd.DataFrame(deploy_data)
+    fmt_names  = ["PyTorch FP32", "PyTorch FP16", "ONNX FP32", "ONNX FP16", "TensorRT FP16"]
+    fmt_fps    = [85, 142, 95, 160, 310]
+    fmt_lat    = [11.8, 7.0, 10.5, 6.2, 3.2]
+    fmt_map    = [0.72, 0.72, 0.72, 0.72, 0.71]
 
     col_c, col_d = st.columns(2)
 
     with col_c:
-        fig_deploy_fps = px.bar(
-            df_deploy, x="Format", y="FPS",
-            color="FPS",
-            color_continuous_scale="RdYlGn",
-            text="FPS",
-            title="Inference Speed by Export Format",
+        fig_deploy = px.bar(
+            x=fmt_names, y=fmt_fps,
+            color=fmt_fps, color_continuous_scale="RdYlGn",
+            text=fmt_fps, title="Inference Speed by Export Format",
+            labels={"x": "Format", "y": "FPS"},
         )
-        fig_deploy_fps.update_layout(
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-            font_color="#c9d1d9", showlegend=False, margin=dict(t=40, b=20),
-        )
-        fig_deploy_fps.update_xaxes(tickangle=-30)
-        st.plotly_chart(fig_deploy_fps, use_container_width=True)
+        fig_deploy.update_layout(**_chart_layout())
+        fig_deploy.update_xaxes(tickangle=-30)
+        st.plotly_chart(fig_deploy, use_container_width=True)
 
     with col_d:
-        st.markdown("##### Benchmark Summary Table")
-        st.dataframe(
-            df_deploy.style
-                .background_gradient(subset=["FPS"], cmap="Greens")
-                .background_gradient(subset=["Latency (ms)"], cmap="Reds_r")
-                .format({"mAP@50": "{:.2f}"}),
-            use_container_width=True,
-        )
+        st.markdown("##### Benchmark Summary")
+        st.table({
+            "Format":       fmt_names,
+            "FPS":          fmt_fps,
+            "Latency (ms)": fmt_lat,
+            "mAP@50":       [f"{v:.2f}" for v in fmt_map],
+        })
 
     # ── Per-class metrics ─────────────────────────────────────────────────────
     st.divider()
-    st.markdown("#### 🏷️ Per-Class Detection Metrics (YOLOv8m — COCO)")
+    st.markdown("#### 🏷️ Per-Class Detection Metrics (YOLOv8n — COCO)")
 
-    class_metrics = {
-        "Class":     CLASS_NAMES,
-        "AP@50":     [0.78, 0.64, 0.81, 0.68, 0.74, 0.69, 0.62, 0.75],
-        "Precision": [0.82, 0.70, 0.86, 0.73, 0.79, 0.74, 0.68, 0.81],
-        "Recall":    [0.74, 0.60, 0.77, 0.64, 0.70, 0.65, 0.57, 0.71],
-        "F1":        [0.78, 0.65, 0.81, 0.68, 0.74, 0.69, 0.62, 0.76],
-    }
-    df_cls = pd.DataFrame(class_metrics)
+    ap_vals   = [0.78, 0.64, 0.81, 0.68, 0.74, 0.69, 0.62, 0.75]
+    prec_vals = [0.82, 0.70, 0.86, 0.73, 0.79, 0.74, 0.68, 0.81]
+    rec_vals  = [0.74, 0.60, 0.77, 0.64, 0.70, 0.65, 0.57, 0.71]
+    f1_vals   = [0.78, 0.65, 0.81, 0.68, 0.74, 0.69, 0.62, 0.76]
+    metrics_to_plot = ["AP@50", "Precision", "Recall", "F1"]
+    metrics_data    = {"AP@50": ap_vals, "Precision": prec_vals, "Recall": rec_vals, "F1": f1_vals}
 
     fig_radar = go.Figure()
-    metrics_to_plot = ["AP@50", "Precision", "Recall", "F1"]
-
-    for _, row in df_cls.iterrows():
+    for i, cls_name in enumerate(CLASS_NAMES):
+        r_vals = [metrics_data[m][i] for m in metrics_to_plot]
         fig_radar.add_trace(go.Scatterpolar(
-            r=[row[m] for m in metrics_to_plot] + [row[metrics_to_plot[0]]],
+            r=r_vals + [r_vals[0]],
             theta=metrics_to_plot + [metrics_to_plot[0]],
-            name=f"{CLASS_ICONS.get(row['Class'],'')} {row['Class']}",
+            name=f"{CLASS_ICONS.get(cls_name,'')} {cls_name}",
             mode="lines",
             line_width=1.5,
         ))
@@ -1053,17 +931,17 @@ def tab_analytics(cfg: Dict) -> None:
         title="Per-Class Metrics Radar Chart",
         legend=dict(orientation="h", y=-0.15),
         margin=dict(t=60, b=80),
+        showlegend=True,
     )
     st.plotly_chart(fig_radar, use_container_width=True)
 
-    # Table
-    st.dataframe(
-        df_cls.style
-            .background_gradient(subset=["AP@50", "Precision", "Recall", "F1"],
-                                  cmap="RdYlGn", vmin=0.5, vmax=0.9)
-            .format({col: "{:.3f}" for col in ["AP@50", "Precision", "Recall", "F1"]}),
-        use_container_width=True,
-    )
+    st.table({
+        "Class":     CLASS_NAMES,
+        "AP@50":     [f"{v:.3f}" for v in ap_vals],
+        "Precision": [f"{v:.3f}" for v in prec_vals],
+        "Recall":    [f"{v:.3f}" for v in rec_vals],
+        "F1":        [f"{v:.3f}" for v in f1_vals],
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1071,7 +949,6 @@ def tab_analytics(cfg: Dict) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    # ── Header ────────────────────────────────────────────────────────────────
     st.markdown("""
     <div style="text-align:center; padding: 24px 0 16px;">
         <h1 style="color:#58a6ff; font-size:2.4rem; font-weight:800;
@@ -1079,37 +956,28 @@ def main() -> None:
             🚗 Autonomous Vehicle Obstacle Detection
         </h1>
         <p style="color:#8b9dc3; font-size:1.05rem; margin:8px 0 0;">
-            Real-Time YOLOv8 Deep Learning Detection System
+            Real-Time YOLOv8n Deep Learning Detection System
         </p>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Sidebar ───────────────────────────────────────────────────────────────
-    cfg = render_sidebar()
-
-    # ── Load model ────────────────────────────────────────────────────────────
+    cfg   = render_sidebar()
     model = load_model(cfg["weights_path"])
 
-    # ── Status banner ─────────────────────────────────────────────────────────
     if model is not None:
         col_s1, col_s2, col_s3, col_s4 = st.columns(4)
         col_s1.metric("🤖 Model", Path(cfg["weights_path"]).stem)
         col_s2.metric("🎯 Confidence", f"{cfg['conf_threshold']:.0%}")
         col_s3.metric("📐 IoU Threshold", f"{cfg['iou_threshold']:.0%}")
-        col_s4.metric(
-            "💻 Device",
-            "GPU 🚀" if cfg["device"] != "cpu" else "CPU",
-        )
+        col_s4.metric("💻 Device", "CPU")
         st.divider()
     else:
         st.warning(
-            "⚠️ No trained model found. The dashboard will use a pretrained "
-            f"`{Path(cfg['weights_path']).stem}` model from Ultralytics. "
+            "⚠️ No trained model found. Using pretrained `yolov8n.pt` from Ultralytics. "
             "Train your own model with `python src/training/train.py` for "
             "obstacle-specific detection."
         )
 
-    # ── Main tabs ─────────────────────────────────────────────────────────────
     tab1, tab2, tab3, tab4 = st.tabs([
         "🖼️  Image Detection",
         "🎬  Video Detection",
@@ -1129,16 +997,13 @@ def main() -> None:
     with tab4:
         tab_analytics(cfg)
 
-    # ── Footer ────────────────────────────────────────────────────────────────
     st.markdown("""
     <hr style="border-color:#21262d; margin:40px 0 10px;"/>
     <div style="text-align:center; color:#6b7280; font-size:0.8rem; padding-bottom:20px;">
         Autonomous Vehicle Obstacle Detection &nbsp;·&nbsp;
-        YOLOv8 &nbsp;·&nbsp; PyTorch &nbsp;·&nbsp; OpenCV &nbsp;·&nbsp; Streamlit<br/>
-        <a href="https://github.com/yourusername/autonomous-obstacle-detection-yolo"
-           style="color:#58a6ff;">
-            ⭐ GitHub Repository
-        </a>
+        YOLOv8n &nbsp;·&nbsp; PyTorch &nbsp;·&nbsp; OpenCV &nbsp;·&nbsp; Streamlit<br/>
+        <a href="https://github.com/pun33th45/autonomous-vehicle-obstacle-detection-yolo"
+           style="color:#58a6ff;">⭐ GitHub Repository</a>
     </div>
     """, unsafe_allow_html=True)
 

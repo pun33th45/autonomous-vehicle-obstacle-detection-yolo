@@ -1,13 +1,8 @@
-# torch is installed separately in Dockerfile.streamlit (CPU wheel)
-# listing it here keeps ultralytics happy without re-downloading
-torch==2.3.1
-torchvision==0.18.1
-
 streamlit==1.35.0
 ultralytics==8.2.0
+torch==2.3.1
+torchvision==0.18.1
 opencv-python-headless==4.9.0.80
 numpy==1.26.4
-pandas
-matplotlib
-plotly
+plotly==5.22.0
 pillow==10.3.0
