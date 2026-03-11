@@ -3,12 +3,12 @@
 # Deploy via: https://dashboard.render.com/select-repo
 #
 # Runtime: Python 3.11 (native)
-# Build strategy:
-#   1. Install runtime deps (onnxruntime, streamlit, etc.)
-#   2. Install torch+ultralytics temporarily (build has 4 GB RAM)
-#   3. Export yolov8n.pt → yolov8n.onnx in the project root
-#   4. Uninstall torch+ultralytics — only onnxruntime remains
-# Runtime RAM: ~180-220 MB (well under Render's 512 MB free limit)
+# Memory strategy:
+#   torch + ultralytics are INSTALLED (via requirements.txt) but the
+#   Streamlit process never imports them.  On first request, load_model()
+#   spawns a subprocess to export yolov8n.pt → yolov8n.onnx (subprocess
+#   uses ~300 MB peak then exits).  All inference uses onnxruntime (~40 MB).
+#   Main process runtime RAM: ~180 MB (well under Render's 512 MB free limit).
 # ============================================================
 
 services:
@@ -18,14 +18,6 @@ services:
     plan: free
     region: oregon
     healthCheckPath: /_stcore/health
-
-    buildCommand: |
-      set -e
-      pip install -r requirements.txt
-      pip install --no-cache-dir torch==2.3.1+cpu torchvision==0.18.1+cpu --index-url https://download.pytorch.org/whl/cpu
-      pip install --no-cache-dir ultralytics==8.2.0
-      python -c "from ultralytics import YOLO; m=YOLO('yolov8n.pt'); m.export(format='onnx',opset=12,simplify=True,dynamic=False,imgsz=640); print('ONNX export complete')"
-      pip uninstall -y torch torchvision ultralytics
 
     startCommand: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true --server.fileWatcherType=none --server.maxUploadSize=50
 

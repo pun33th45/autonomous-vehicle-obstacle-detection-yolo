@@ -1,8 +1,13 @@
-# Runtime dependencies only — no torch, no ultralytics.
-# torch is installed temporarily during the Render build phase (see render.yaml
-# buildCommand) to export yolov8n.onnx, then uninstalled before the app starts.
-# onnxruntime handles inference (~40 MB vs PyTorch's ~700 MB).
+# CPU-only torch wheel server — avoids the 2 GB GPU build from PyPI.
+# torch + ultralytics are INSTALLED but never imported by the Streamlit process.
+# They are only used inside a one-time export subprocess (see load_model in app.py).
+# Runtime RAM: ~180 MB (onnxruntime only).  Subprocess RAM peak: ~300 MB.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.3.1+cpu
+torchvision==0.18.1+cpu
+ultralytics==8.2.0
 
+# ── Runtime deps ──────────────────────────────────────────────────────────────
 streamlit==1.35.0
 onnxruntime==1.18.0
 opencv-python-headless==4.9.0.80

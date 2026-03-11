@@ -180,17 +180,74 @@ st.markdown("""
 #  Model Loading — cached singleton, CPU-only
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_resource(show_spinner="⚙️ Loading ONNX model…")
+def _export_onnx_via_subprocess(target: Path) -> None:
+    """
+    Export yolov8n.pt → ONNX in an isolated subprocess.
+
+    torch + ultralytics are installed in the venv (requirements.txt) but this
+    function is the ONLY place they are ever used.  Running in a subprocess
+    means torch never enters the main Streamlit process's address space, so
+    the Streamlit process stays at ~180 MB instead of ~400 MB.
+
+    The subprocess exits when the export is done and its ~300 MB is freed.
+    """
+    import subprocess, sys, shutil
+
+    # Script receives target path as sys.argv[1]
+    script = """
+import sys, shutil
+from pathlib import Path
+from ultralytics import YOLO
+
+target = Path(sys.argv[1])
+m = YOLO('yolov8n.pt')
+exported = m.export(format='onnx', opset=12, simplify=True, dynamic=False, imgsz=640)
+exported_path = Path(str(exported))
+if exported_path.exists() and exported_path.resolve() != target.resolve():
+    shutil.copy2(exported_path, target)
+print('ONNX ready:', target, '| exists:', target.exists())
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(target)],
+        capture_output=True, text=True, timeout=300,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ONNX export subprocess failed (exit {result.returncode}):\n"
+            f"{result.stderr[-2000:]}"
+        )
+
+
+@st.cache_resource(show_spinner="⚙️ Preparing ONNX model (first run may take ~60 s)…")
 def load_model(weights_path: str):
     """
-    Load the ONNX inference session once and cache it for the session lifetime.
-    Uses onnxruntime-cpu (~40 MB) instead of PyTorch to stay within
-    Render's 512 MB RAM limit.
+    Load the ONNX inference session, exporting it first if needed.
+
+    torch + ultralytics run in a subprocess for the one-time export so they
+    never occupy RAM in the main Streamlit process.  After the export the
+    session is loaded with onnxruntime-cpu (~40 MB).
     """
+    import onnxruntime as ort
+
+    onnx_path = Path(weights_path)
+
+    if not onnx_path.exists():
+        try:
+            _export_onnx_via_subprocess(onnx_path)
+        except Exception as exc:
+            st.error(f"❌ ONNX export failed: {exc}")
+            return None
+
+    if not onnx_path.exists():
+        st.error(
+            f"❌ ONNX model not found at `{onnx_path}` even after export attempt. "
+            "Check the service logs for details."
+        )
+        return None
+
     try:
-        import onnxruntime as ort
-        sess = ort.InferenceSession(weights_path, providers=["CPUExecutionProvider"])
-        return sess
+        return ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     except Exception as exc:
         st.error(f"❌ Failed to load ONNX model: {exc}")
         return None
@@ -996,18 +1053,6 @@ def main() -> None:
     """, unsafe_allow_html=True)
 
     cfg   = render_sidebar()
-
-    # Pre-flight: confirm ONNX file exists before attempting to load
-    onnx_path = Path(cfg["weights_path"])
-    if not onnx_path.exists():
-        st.error(
-            f"❌ ONNX model not found at `{onnx_path}`. "
-            "On Render this file is baked into the Docker image by the multi-stage build. "
-            "If running locally, export it with: "
-            "`python -c \"from ultralytics import YOLO; YOLO('yolov8n.pt').export(format='onnx')\"`"
-        )
-        st.stop()
-
     model = load_model(cfg["weights_path"])
 
     if model is not None:
