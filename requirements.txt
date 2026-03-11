@@ -4,7 +4,7 @@
 # ultralytics pulls in torch as a dep — pip will see it already satisfied.
 
 streamlit==1.35.0
-ultralytics==8.2.0
+onnxruntime-cpu==1.18.0
 opencv-python-headless==4.9.0.80
 numpy==1.26.4
 plotly==5.22.0

@@ -83,10 +83,23 @@ CLASS_COLORS_HEX: List[str] = [
     "#00DCDC", "#960096", "#00C8FF", "#32FF96",
 ]
 
-WEIGHTS_DIR = ROOT / "models" / "weights"
-DEFAULT_WEIGHTS = WEIGHTS_DIR / "best.pt"
+# ONNX model baked into the image by the multi-stage Docker build
+ONNX_MODEL = ROOT / "yolov8n.onnx"
+ONNX_INPUT_SIZE = 640   # letterbox target size
 
-# Maximum edge length before resizing (keeps RAM under control)
+# COCO class ID → our display name (automotive subset only)
+COCO_AUTOMOTIVE: Dict[int, str] = {
+    0:  "pedestrian",    # person
+    1:  "bicycle",
+    2:  "car",
+    3:  "motorcycle",
+    5:  "bus",
+    7:  "truck",
+    9:  "traffic_light",
+    11: "stop_sign",
+}
+
+# Maximum edge length for video output scaling (saves disk/RAM)
 MAX_INFER_SIZE = 640
 
 # ─── Inline CSS ───────────────────────────────────────────────────────────────
@@ -167,19 +180,19 @@ st.markdown("""
 #  Model Loading — cached singleton, CPU-only
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_resource(show_spinner="⚙️ Loading model weights…")
+@st.cache_resource(show_spinner="⚙️ Loading ONNX model…")
 def load_model(weights_path: str):
     """
-    Load a YOLO model once and cache it for the session lifetime.
-    Always runs on CPU to stay within Render's 512 MB RAM limit.
+    Load the ONNX inference session once and cache it for the session lifetime.
+    Uses onnxruntime-cpu (~40 MB) instead of PyTorch to stay within
+    Render's 512 MB RAM limit.
     """
     try:
-        from ultralytics import YOLO
-        model = YOLO(weights_path)
-        model.to("cpu")
-        return model
+        import onnxruntime as ort
+        sess = ort.InferenceSession(weights_path, providers=["CPUExecutionProvider"])
+        return sess
     except Exception as exc:
-        st.error(f"❌ Failed to load model: {exc}")
+        st.error(f"❌ Failed to load ONNX model: {exc}")
         return None
 
 
@@ -187,14 +200,42 @@ def load_model(weights_path: str):
 #  Inference helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _resize_for_inference(img: np.ndarray) -> np.ndarray:
-    """Resize image so the longest edge ≤ MAX_INFER_SIZE (saves RAM)."""
+def _letterbox(
+    img: np.ndarray, new_size: int = ONNX_INPUT_SIZE,
+) -> Tuple[np.ndarray, float, Tuple[int, int]]:
+    """Resize + pad to a square while preserving aspect ratio."""
     h, w = img.shape[:2]
-    if max(h, w) > MAX_INFER_SIZE:
-        scale = MAX_INFER_SIZE / max(h, w)
-        img = cv2.resize(img, (int(w * scale), int(h * scale)),
-                         interpolation=cv2.INTER_AREA)
-    return img
+    scale = new_size / max(h, w)
+    nh, nw = int(h * scale), int(w * scale)
+    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    pad_h, pad_w = new_size - nh, new_size - nw
+    top, left = pad_h // 2, pad_w // 2
+    padded = cv2.copyMakeBorder(
+        resized, top, pad_h - top, left, pad_w - left,
+        cv2.BORDER_CONSTANT, value=(114, 114, 114),
+    )
+    return padded, scale, (top, left)
+
+
+def _nms(
+    boxes: np.ndarray, scores: np.ndarray, iou_thresh: float,
+) -> List[int]:
+    """Greedy NMS; returns surviving indices sorted by descending score."""
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+    keep: List[int] = []
+    while order.size > 0:
+        i = int(order[0])
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+        order = order[1:][iou <= iou_thresh]
+    return keep
 
 
 def run_inference(
@@ -204,61 +245,76 @@ def run_inference(
     iou: float,
 ) -> Tuple[np.ndarray, List[Dict[str, Any]], float]:
     """
-    Run YOLOv8 inference on a BGR image.
+    Run YOLOv8n ONNX inference on a BGR image.
 
     Returns:
         (annotated_image, list_of_dets, inference_ms)
     """
-    # Resize before inference to cap RAM usage
-    image = _resize_for_inference(image)
+    orig_h, orig_w = image.shape[:2]
 
+    # ── Preprocess: letterbox → RGB → NCHW float32 ──────────────────────────
+    padded, scale, (pad_top, pad_left) = _letterbox(image)
+    rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    inp = rgb.transpose(2, 0, 1)[np.newaxis]          # [1, 3, 640, 640]
+
+    # ── Forward pass ─────────────────────────────────────────────────────────
     t0 = time.perf_counter()
-    results = model.predict(
-        image,
-        conf=conf,
-        iou=iou,
-        device="cpu",
-        verbose=False,
-    )
+    raw = model.run(None, {model.get_inputs()[0].name: inp})[0]  # [1, 84, 8400]
     inf_ms = (time.perf_counter() - t0) * 1000
+
+    pred = raw[0].T                                   # [8400, 84]
+    cx, cy, bw, bh = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
+    class_scores = pred[:, 4:]                        # [8400, 80]
+
+    # cx,cy,w,h → x1,y1,x2,y2 in padded-image coords
+    bx1, by1 = cx - bw / 2, cy - bh / 2
+    bx2, by2 = cx + bw / 2, cy + bh / 2
 
     detections: List[Dict[str, Any]] = []
     annotated = image.copy()
+    coco_keys = list(COCO_AUTOMOTIVE.keys())
 
-    for result in results:
-        if result.boxes is None:
+    # ── Per-class NMS over automotive COCO classes ────────────────────────────
+    for coco_id, cls_name in COCO_AUTOMOTIVE.items():
+        if coco_id >= class_scores.shape[1]:
             continue
-        for box in result.boxes:
-            cls_id   = int(box.cls.item())
-            conf_val = float(box.conf.item())
-            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+        cls_conf = class_scores[:, coco_id]
+        mask = cls_conf >= conf
+        if not mask.any():
+            continue
 
-            # Use model's own class names if available, else fall back to ours
-            if hasattr(result, "names") and result.names:
-                cls_name = result.names.get(cls_id, str(cls_id))
-            elif cls_id < len(CLASS_NAMES):
-                cls_name = CLASS_NAMES[cls_id]
-            else:
-                cls_name = str(cls_id)
+        boxes_m  = np.stack([bx1[mask], by1[mask], bx2[mask], by2[mask]], axis=1)
+        scores_m = cls_conf[mask]
+        keep     = _nms(boxes_m, scores_m, iou)
 
-            color = CLASS_COLORS_BGR[cls_id % len(CLASS_COLORS_BGR)]
+        display_idx = coco_keys.index(coco_id)
+        color = CLASS_COLORS_BGR[display_idx % len(CLASS_COLORS_BGR)]
 
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        for k in keep:
+            # Unscale from padded coords back to original image coords
+            ix1 = max(0, int((boxes_m[k, 0] - pad_left) / scale))
+            iy1 = max(0, int((boxes_m[k, 1] - pad_top)  / scale))
+            ix2 = min(orig_w, int((boxes_m[k, 2] - pad_left) / scale))
+            iy2 = min(orig_h, int((boxes_m[k, 3] - pad_top)  / scale))
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+
+            conf_val = float(scores_m[k])
+            cv2.rectangle(annotated, (ix1, iy1), (ix2, iy2), color, 2)
             label = f"{cls_name}  {conf_val:.2f}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-            cv2.rectangle(annotated, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-            cv2.putText(annotated, label, (x1 + 2, y1 - 3),
+            cv2.rectangle(annotated, (ix1, iy1 - th - 6), (ix1 + tw + 4, iy1), color, -1)
+            cv2.putText(annotated, label, (ix1 + 2, iy1 - 3),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
             detections.append({
-                "class_id":   cls_id,
+                "class_id":   display_idx,
                 "class_name": cls_name,
                 "confidence": round(conf_val, 4),
-                "bbox":       [x1, y1, x2, y2],
+                "bbox":       [ix1, iy1, ix2, iy2],
             })
 
-    # Free result objects immediately
-    del results
+    del raw, pred
     gc.collect()
 
     return annotated, detections, inf_ms
@@ -287,31 +343,9 @@ def render_sidebar() -> Dict[str, Any]:
         # ── Model Settings ────────────────────────────────────────────────────
         st.markdown("### ⚙️ Model Settings")
 
-        # Nano model only on free tier — keeps RAM well under 512 MB.
-        # Custom allows pointing to a locally placed best.pt.
-        model_choice = st.selectbox(
-            "Model Variant",
-            options=["yolov8n", "Custom"],
-            index=0,
-            help="yolov8n is the lightest model (~6 MB, ~120 MB RAM). "
-                 "Choose Custom to load your own trained weights.",
-        )
-
-        if model_choice == "Custom":
-            custom_path = st.text_input(
-                "Weights Path",
-                value=str(DEFAULT_WEIGHTS),
-                placeholder="models/weights/best.pt",
-            )
-            weights_path = custom_path
-        else:
-            if DEFAULT_WEIGHTS.exists():
-                weights_path = str(DEFAULT_WEIGHTS)
-            else:
-                weights_path = "yolov8n.pt"
-
-        st.caption(f"📂 `{Path(weights_path).name}`")
-        st.info("💻 Inference runs on **CPU** (Render free tier)", icon="ℹ️")
+        weights_path = str(ONNX_MODEL)
+        st.caption("📂 `yolov8n.onnx`")
+        st.info("💻 Inference via **ONNX Runtime** (CPU, ~40 MB)", icon="ℹ️")
 
         st.divider()
 
@@ -349,7 +383,7 @@ def render_sidebar() -> Dict[str, Any]:
         st.markdown("""
         <div style="color:#6b7280; font-size:0.78rem; text-align:center;">
             <b>Autonomous Obstacle Detection</b><br/>
-            YOLOv8n · PyTorch · OpenCV<br/>
+            YOLOv8n · ONNX Runtime · OpenCV<br/>
             <a href="https://github.com/pun33th45/autonomous-vehicle-obstacle-detection-yolo"
                style="color:#58a6ff;">GitHub ↗</a>
         </div>
@@ -973,9 +1007,8 @@ def main() -> None:
         st.divider()
     else:
         st.warning(
-            "⚠️ No trained model found. Using pretrained `yolov8n.pt` from Ultralytics. "
-            "Train your own model with `python src/training/train.py` for "
-            "obstacle-specific detection."
+            "⚠️ Model not loaded. Ensure `yolov8n.onnx` is present in the app directory. "
+            "On Render it is baked into the Docker image during the build stage."
         )
 
     tab1, tab2, tab3, tab4 = st.tabs([
@@ -1001,7 +1034,7 @@ def main() -> None:
     <hr style="border-color:#21262d; margin:40px 0 10px;"/>
     <div style="text-align:center; color:#6b7280; font-size:0.8rem; padding-bottom:20px;">
         Autonomous Vehicle Obstacle Detection &nbsp;·&nbsp;
-        YOLOv8n &nbsp;·&nbsp; PyTorch &nbsp;·&nbsp; OpenCV &nbsp;·&nbsp; Streamlit<br/>
+        YOLOv8n &nbsp;·&nbsp; ONNX Runtime &nbsp;·&nbsp; OpenCV &nbsp;·&nbsp; Streamlit<br/>
         <a href="https://github.com/pun33th45/autonomous-vehicle-obstacle-detection-yolo"
            style="color:#58a6ff;">⭐ GitHub Repository</a>
     </div>

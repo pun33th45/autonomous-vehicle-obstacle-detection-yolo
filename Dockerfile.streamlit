@@ -1,8 +1,31 @@
 # ============================================================
-# Streamlit frontend — CPU-only, Python 3.11-slim (Debian bookworm)
-# Memory-optimised for Render free tier (~512 MB RAM)
+# Multi-stage build — eliminates PyTorch from the runtime image.
+#
+# Stage 1 (model_exporter): installs torch + ultralytics, exports
+#   yolov8n.pt → yolov8n.onnx, then is discarded.
+# Stage 2 (runtime): copies only the ONNX file and installs
+#   onnxruntime-cpu (~40 MB installed vs torch's ~700 MB).
+#
+# Runtime memory: ~180–220 MB  (well under Render's 512 MB limit)
 # ============================================================
 
+# ── Stage 1: Export ONNX model (NOT shipped in the final image) ──
+FROM python:3.11-slim AS model_exporter
+
+RUN pip install --no-cache-dir \
+        torch==2.3.1 torchvision==0.18.1 \
+        --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir ultralytics==8.2.0
+
+WORKDIR /export
+RUN python -c "\
+from ultralytics import YOLO; \
+m = YOLO('yolov8n.pt'); \
+m.export(format='onnx', opset=12, simplify=True, dynamic=False, imgsz=640); \
+print('ONNX export complete: yolov8n.onnx') \
+"
+
+# ── Stage 2: Minimal runtime (no torch, no ultralytics) ──────────
 FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -10,52 +33,34 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
     PORT=8501 \
-    # Tell ultralytics not to phone home / check for updates on startup
-    YOLO_CONFIG_DIR=/app/.ultralytics \
-    # Trim unused memory aggressively (helps stay under 512 MB on free tier)
-    MALLOC_TRIM_THRESHOLD_=100000
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1
 
-# ── System libraries needed by OpenCV + Pillow ───────────────
+# OpenCV headless system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
         libsm6 \
         libxext6 \
-        zlib1g-dev \
-        libjpeg-dev \
-        libpng-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# ── 1. Install CPU-only PyTorch FIRST ────────────────────────
-# Must come before requirements.txt so ultralytics sees torch already
-# installed and does NOT reinstall the 2 GB GPU build from PyPI.
-# The +cpu suffix (e.g. 2.3.1+cpu) differs from the bare version string
-# (2.3.1) — if torch appears in requirements.txt pip would overwrite it.
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir \
-        torch==2.3.1 torchvision==0.18.1 \
-        --index-url https://download.pytorch.org/whl/cpu
-
-# ── 2. Install remaining Python dependencies ─────────────────
+# Install runtime dependencies (no torch!)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# ── 3. Pre-download yolov8n.pt into the image ────────────────
-# Without this, the model downloads on the first request, causing
-# Render's health-check to time out → 502 error.
-RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')" && \
-    echo "yolov8n.pt downloaded OK"
+# Copy ONNX weights from the exporter stage
+COPY --from=model_exporter /export/yolov8n.onnx /app/yolov8n.onnx
 
-# ── 4. Copy project files ────────────────────────────────────
+# Copy application code
 COPY . .
 RUN mkdir -p models/weights
 
-# ── Expose port (Render overrides $PORT at runtime) ──────────
 EXPOSE 8501
 
-# ── Start Streamlit (shell form so $PORT is expanded) ────────
+# Shell form so Render's $PORT is expanded at runtime
 CMD streamlit run app.py \
         --server.port=$PORT \
         --server.address=0.0.0.0 \
