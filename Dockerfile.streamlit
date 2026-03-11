@@ -9,7 +9,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
-    PORT=8501
+    PORT=8501 \
+    # Tell ultralytics not to phone home / check for updates on startup
+    YOLO_CONFIG_DIR=/app/.ultralytics \
+    # Trim unused memory aggressively (helps stay under 512 MB on free tier)
+    MALLOC_TRIM_THRESHOLD_=100000
 
 # ── System libraries needed by OpenCV + Pillow ───────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,17 +28,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# ── Install CPU-only PyTorch first (avoids 2 GB GPU download) ─
+# ── 1. Install CPU-only PyTorch FIRST ────────────────────────
+# Must come before requirements.txt so ultralytics sees torch already
+# installed and does NOT reinstall the 2 GB GPU build from PyPI.
+# The +cpu suffix (e.g. 2.3.1+cpu) differs from the bare version string
+# (2.3.1) — if torch appears in requirements.txt pip would overwrite it.
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
         torch==2.3.1 torchvision==0.18.1 \
         --index-url https://download.pytorch.org/whl/cpu
 
-# ── Install remaining Python dependencies ────────────────────
+# ── 2. Install remaining Python dependencies ─────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Copy project files ───────────────────────────────────────
+# ── 3. Pre-download yolov8n.pt into the image ────────────────
+# Without this, the model downloads on the first request, causing
+# Render's health-check to time out → 502 error.
+RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')" && \
+    echo "yolov8n.pt downloaded OK"
+
+# ── 4. Copy project files ────────────────────────────────────
 COPY . .
 RUN mkdir -p models/weights
 
@@ -46,4 +60,5 @@ CMD streamlit run app.py \
         --server.port=$PORT \
         --server.address=0.0.0.0 \
         --server.headless=true \
-        --server.fileWatcherType=none
+        --server.fileWatcherType=none \
+        --server.maxUploadSize=50

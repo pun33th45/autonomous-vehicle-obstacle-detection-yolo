@@ -1,7 +1,10 @@
+# torch + torchvision are installed from the CPU wheel in Dockerfile.streamlit.
+# Listing them here would cause pip to reinstall the GPU build from PyPI
+# (because +cpu suffix makes the version string different), blowing 512 MB RAM.
+# ultralytics pulls in torch as a dep — pip will see it already satisfied.
+
 streamlit==1.35.0
 ultralytics==8.2.0
-torch==2.3.1
-torchvision==0.18.1
 opencv-python-headless==4.9.0.80
 numpy==1.26.4
 plotly==5.22.0
