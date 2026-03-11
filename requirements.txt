@@ -2,8 +2,8 @@ streamlit==1.35.0
 ultralytics==8.2.0
 torch
 opencv-python-headless==4.9.0.80
-numpy
+numpy==1.26.4
 pandas
 matplotlib
 plotly
-pillow
+pillow==10.2.0
