@@ -1,10 +1,10 @@
-# torch + torchvision are installed from the CPU wheel in Dockerfile.streamlit.
-# Listing them here would cause pip to reinstall the GPU build from PyPI
-# (because +cpu suffix makes the version string different), blowing 512 MB RAM.
-# ultralytics pulls in torch as a dep — pip will see it already satisfied.
+# Runtime dependencies only — no torch, no ultralytics.
+# torch is installed temporarily during the Render build phase (see render.yaml
+# buildCommand) to export yolov8n.onnx, then uninstalled before the app starts.
+# onnxruntime handles inference (~40 MB vs PyTorch's ~700 MB).
 
 streamlit==1.35.0
-onnxruntime-cpu==1.18.0
+onnxruntime==1.18.0
 opencv-python-headless==4.9.0.80
 numpy==1.26.4
 plotly==5.22.0

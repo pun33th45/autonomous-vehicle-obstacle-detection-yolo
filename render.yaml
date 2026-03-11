@@ -1,21 +1,40 @@
 # ============================================================
 # Render Blueprint — Autonomous Vehicle Obstacle Detection
 # Deploy via: https://dashboard.render.com/select-repo
+#
+# Runtime: Python 3.11 (native)
+# Build strategy:
+#   1. Install runtime deps (onnxruntime, streamlit, etc.)
+#   2. Install torch+ultralytics temporarily (build has 4 GB RAM)
+#   3. Export yolov8n.pt → yolov8n.onnx in the project root
+#   4. Uninstall torch+ultralytics — only onnxruntime remains
+# Runtime RAM: ~180-220 MB (well under Render's 512 MB free limit)
 # ============================================================
 
 services:
   - type: web
     name: autonomous-obstacle-detection
-    runtime: docker
-    dockerfilePath: ./Dockerfile.streamlit
-    dockerContext: .
-    plan: free          # upgrade to starter/standard for more RAM
-    region: oregon      # us-west-2 — change to frankfurt/singapore if needed
-
-    # Render injects PORT; Streamlit reads it from $PORT
-    # Health check — Streamlit's built-in health endpoint
+    env: python
+    plan: free
+    region: oregon
     healthCheckPath: /_stcore/health
+
+    buildCommand: |
+      set -e
+      pip install -r requirements.txt
+      pip install --no-cache-dir torch==2.3.1+cpu torchvision==0.18.1+cpu --index-url https://download.pytorch.org/whl/cpu
+      pip install --no-cache-dir ultralytics==8.2.0
+      python -c "from ultralytics import YOLO; m=YOLO('yolov8n.pt'); m.export(format='onnx',opset=12,simplify=True,dynamic=False,imgsz=640); print('ONNX export complete')"
+      pip uninstall -y torch torchvision ultralytics
+
+    startCommand: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true --server.fileWatcherType=none --server.maxUploadSize=50
 
     envVars:
       - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: OPENBLAS_NUM_THREADS
         value: "1"
