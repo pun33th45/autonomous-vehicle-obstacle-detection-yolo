@@ -1,0 +1,51 @@
+# ============================================================
+# Streamlit frontend — CPU-only, Python 3.11-slim (Debian bookworm)
+# For deployment on Render / any container host
+# ============================================================
+
+FROM python:3.11-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    PORT=8501
+
+# ── System libraries needed by OpenCV + Pillow ───────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        zlib1g-dev \
+        libjpeg-dev \
+        libpng-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── Install CPU-only PyTorch first (avoids 2 GB GPU download) ─
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+        torch==2.3.1 torchvision==0.18.1 \
+        --index-url https://download.pytorch.org/whl/cpu
+
+# ── Install remaining Python dependencies ────────────────────
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ── Copy project files ───────────────────────────────────────
+COPY . .
+
+# Create runtime directories (model weights, etc.)
+RUN mkdir -p models/weights
+
+# ── Expose port (Render overrides $PORT at runtime) ──────────
+EXPOSE 8501
+
+# ── Start Streamlit (shell form so $PORT is expanded) ────────
+CMD streamlit run app.py \
+        --server.port=$PORT \
+        --server.address=0.0.0.0 \
+        --server.headless=true \
+        --server.fileWatcherType=none

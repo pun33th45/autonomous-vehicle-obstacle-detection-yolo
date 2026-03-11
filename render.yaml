@@ -1,0 +1,21 @@
+# ============================================================
+# Render Blueprint — Autonomous Vehicle Obstacle Detection
+# Deploy via: https://dashboard.render.com/select-repo
+# ============================================================
+
+services:
+  - type: web
+    name: autonomous-obstacle-detection
+    runtime: docker
+    dockerfilePath: ./Dockerfile.streamlit
+    dockerContext: .
+    plan: free          # upgrade to starter/standard for more RAM
+    region: oregon      # us-west-2 — change to frankfurt/singapore if needed
+
+    # Render injects PORT; Streamlit reads it from $PORT
+    # Health check — Streamlit's built-in health endpoint
+    healthCheckPath: /_stcore/health
+
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
