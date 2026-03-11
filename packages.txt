@@ -1,0 +1,8 @@
+# System packages required for Streamlit Cloud deployment
+# (installed via apt-get before pip install)
+libgl1-mesa-glx
+libglib2.0-0
+libsm6
+libxext6
+libxrender-dev
+ffmpeg

@@ -1,0 +1,28 @@
+# ============================================================
+# Streamlit App Configuration
+# ============================================================
+
+[theme]
+base            = "dark"
+primaryColor    = "#58a6ff"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#161b27"
+textColor       = "#c9d1d9"
+font            = "sans serif"
+
+[server]
+maxUploadSize   = 200          # Max upload size in MB
+enableCORS      = false
+enableXsrfProtection = true
+headless        = true         # Required for cloud deployment
+port            = 8501
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+magicEnabled    = true
+fastReruns      = true
+
+[logger]
+level           = "info"

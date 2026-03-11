@@ -1,0 +1,24 @@
+# ── Line ending normalisation ─────────────────────────────────
+# Normalise all text files to LF on commit (cross-platform safe)
+* text=auto eol=lf
+
+# ── Force LF for specific file types ─────────────────────────
+*.py    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.toml  text eol=lf
+*.json  text eol=lf
+*.sh    text eol=lf
+
+# ── Treat binary files as binary (no line-ending changes) ─────
+*.pt     binary
+*.pth    binary
+*.onnx   binary
+*.engine binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.mp4    binary
+*.avi    binary

@@ -1,0 +1,61 @@
+version: "3.9"
+
+services:
+  # ── Obstacle Detection API ──────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: obstacle-detection-api:latest
+    container_name: obstacle-detection-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models/weights:/app/models/weights:ro
+      - ./data:/app/data:ro
+      - ./logs:/app/logs
+      - ./runs:/app/runs
+    environment:
+      - PYTHONPATH=/app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Optional: Training Service ──────────────────────────────
+  train:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: obstacle-detection-train:latest
+    container_name: obstacle-detection-train
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./runs:/app/runs
+      - ./configs:/app/configs
+    environment:
+      - PYTHONPATH=/app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      python src/training/train.py
+        --config configs/training_config.yaml
+    profiles:
+      - training

@@ -1,0 +1,93 @@
+# ============================================================
+# .gitignore — Autonomous Vehicle Obstacle Detection (YOLO)
+# Python + Deep Learning + Streamlit Project
+# ============================================================
+
+# ── Python cache ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.manifest
+*.spec
+
+# ── Virtual environments ──────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# ── Jupyter ───────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── Large dataset directories (do NOT upload raw/processed data) ──
+data/raw/
+data/processed/
+data/annotations/
+temp/
+
+# ── Model weights ─────────────────────────────────────────────
+# Ignore pretrained/intermediate downloads
+models/weights/yolov8*.pt
+models/weights/yolov5*.pt
+models/weights/*.onnx
+models/weights/*.engine
+models/checkpoints/
+
+# Ignore loose weight files everywhere…
+*.pth
+*.pt
+
+# …EXCEPT keep the final trained weights
+!models/weights/best.pt
+!models/weights/last.pt
+
+# ── Training / inference run outputs ─────────────────────────
+runs/
+logs/
+
+# ── IDE & OS ─────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Testing artefacts ─────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ── Optuna study databases ────────────────────────────────────
+*.db
+
+# ── Secrets / environment files ───────────────────────────────
+.env
+.env.local
+*.env
+.streamlit/secrets.toml
+
+# ── Temporary & log files ────────────────────────────────────
+*.tmp
+*.bak
+*.log
+
+# ============================================================
+# ✅ NEVER IGNORED (always tracked):
+#    app.py               — Streamlit dashboard
+#    requirements.txt     — dependency spec
+#    README.md            — documentation
+#    models/weights/best.pt  — final trained weights
+# ============================================================
