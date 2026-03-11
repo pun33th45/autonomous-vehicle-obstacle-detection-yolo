@@ -2,7 +2,7 @@
 app.py
 ------
 Streamlit Dashboard for Autonomous Vehicle Obstacle Detection.
-Memory-optimised for Render free tier (~512 MB RAM).
+Deployed on Hugging Face Spaces (Streamlit SDK).
 
 Sections:
   🖼️  Image Detection  — Upload & analyse images
@@ -50,32 +50,33 @@ st.set_page_config(
 )
 
 # ─── Constants ────────────────────────────────────────────────────────────────
+# Automotive COCO class names as returned by ultralytics/YOLOv8
 CLASS_NAMES: List[str] = [
-    "pedestrian", "bicycle", "car", "motorcycle",
-    "bus", "truck", "traffic_light", "stop_sign",
+    "person", "bicycle", "car", "motorcycle",
+    "bus", "truck", "traffic light", "stop sign",
 ]
 
 CLASS_ICONS: Dict[str, str] = {
-    "pedestrian":    "🚶",
+    "person":        "🚶",
     "bicycle":       "🚲",
     "car":           "🚗",
     "motorcycle":    "🏍️",
     "bus":           "🚌",
     "truck":         "🚛",
-    "traffic_light": "🚦",
-    "stop_sign":     "🛑",
+    "traffic light": "🚦",
+    "stop sign":     "🛑",
 }
 
 # Distinct colour palette (BGR for OpenCV, RGB for display)
 CLASS_COLORS_BGR: List[Tuple[int, int, int]] = [
-    (0,   200,  50),   # pedestrian  — green
-    (255, 140,   0),   # bicycle     — orange
-    (30,   80, 255),   # car         — blue
-    (200,   0, 200),   # motorcycle  — magenta
-    (0,   220, 220),   # bus         — cyan
-    (150,   0, 150),   # truck       — purple
-    (0,   200, 255),   # traffic_light — yellow-blue
-    (50,  255, 150),   # stop_sign   — teal
+    (0,   200,  50),   # person        — green
+    (255, 140,   0),   # bicycle       — orange
+    (30,   80, 255),   # car           — blue
+    (200,   0, 200),   # motorcycle    — magenta
+    (0,   220, 220),   # bus           — cyan
+    (150,   0, 150),   # truck         — purple
+    (0,   200, 255),   # traffic light — yellow-blue
+    (50,  255, 150),   # stop sign     — teal
 ]
 
 CLASS_COLORS_HEX: List[str] = [
@@ -83,23 +84,7 @@ CLASS_COLORS_HEX: List[str] = [
     "#00DCDC", "#960096", "#00C8FF", "#32FF96",
 ]
 
-# ONNX model baked into the image by the multi-stage Docker build
-ONNX_MODEL = ROOT / "yolov8n.onnx"
-ONNX_INPUT_SIZE = 640   # letterbox target size
-
-# COCO class ID → our display name (automotive subset only)
-COCO_AUTOMOTIVE: Dict[int, str] = {
-    0:  "pedestrian",    # person
-    1:  "bicycle",
-    2:  "car",
-    3:  "motorcycle",
-    5:  "bus",
-    7:  "truck",
-    9:  "traffic_light",
-    11: "stop_sign",
-}
-
-# Maximum edge length for video output scaling (saves disk/RAM)
+# Resize images longer than this before inference (keeps UI responsive)
 MAX_INFER_SIZE = 640
 
 # ─── Inline CSS ───────────────────────────────────────────────────────────────
@@ -177,122 +162,30 @@ st.markdown("""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Model Loading — cached singleton, CPU-only
+#  Model Loading — cached singleton
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _export_onnx_via_subprocess(target: Path) -> None:
-    """
-    Export yolov8n.pt → ONNX in an isolated subprocess.
-
-    torch + ultralytics are installed in the venv (requirements.txt) but this
-    function is the ONLY place they are ever used.  Running in a subprocess
-    means torch never enters the main Streamlit process's address space, so
-    the Streamlit process stays at ~180 MB instead of ~400 MB.
-
-    The subprocess exits when the export is done and its ~300 MB is freed.
-    """
-    import subprocess, sys, shutil
-
-    # Script receives target path as sys.argv[1]
-    script = """
-import sys, shutil
-from pathlib import Path
-from ultralytics import YOLO
-
-target = Path(sys.argv[1])
-m = YOLO('yolov8n.pt')
-exported = m.export(format='onnx', opset=12, simplify=True, dynamic=False, imgsz=640)
-exported_path = Path(str(exported))
-if exported_path.exists() and exported_path.resolve() != target.resolve():
-    shutil.copy2(exported_path, target)
-print('ONNX ready:', target, '| exists:', target.exists())
-"""
-
-    result = subprocess.run(
-        [sys.executable, "-c", script, str(target)],
-        capture_output=True, text=True, timeout=300,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"ONNX export subprocess failed (exit {result.returncode}):\n"
-            f"{result.stderr[-2000:]}"
-        )
-
-
-@st.cache_resource(show_spinner="⚙️ Preparing ONNX model (first run may take ~60 s)…")
-def load_model(weights_path: str):
-    """
-    Load the ONNX inference session, exporting it first if needed.
-
-    torch + ultralytics run in a subprocess for the one-time export so they
-    never occupy RAM in the main Streamlit process.  After the export the
-    session is loaded with onnxruntime-cpu (~40 MB).
-    """
-    import onnxruntime as ort
-
-    onnx_path = Path(weights_path)
-
-    if not onnx_path.exists():
-        try:
-            _export_onnx_via_subprocess(onnx_path)
-        except Exception as exc:
-            st.error(f"❌ ONNX export failed: {exc}")
-            return None
-
-    if not onnx_path.exists():
-        st.error(
-            f"❌ ONNX model not found at `{onnx_path}` even after export attempt. "
-            "Check the service logs for details."
-        )
-        return None
-
-    try:
-        return ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    except Exception as exc:
-        st.error(f"❌ Failed to load ONNX model: {exc}")
-        return None
+@st.cache_resource(show_spinner="⚙️ Loading YOLOv8n model…")
+def load_model():
+    """Load YOLOv8n once and cache it for the session lifetime."""
+    from ultralytics import YOLO
+    model = YOLO("yolov8n.pt")
+    model.to("cpu")
+    return model
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Inference helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _letterbox(
-    img: np.ndarray, new_size: int = ONNX_INPUT_SIZE,
-) -> Tuple[np.ndarray, float, Tuple[int, int]]:
-    """Resize + pad to a square while preserving aspect ratio."""
+def _resize_for_inference(img: np.ndarray) -> np.ndarray:
+    """Resize so the longest edge ≤ MAX_INFER_SIZE (keeps inference snappy)."""
     h, w = img.shape[:2]
-    scale = new_size / max(h, w)
-    nh, nw = int(h * scale), int(w * scale)
-    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    pad_h, pad_w = new_size - nh, new_size - nw
-    top, left = pad_h // 2, pad_w // 2
-    padded = cv2.copyMakeBorder(
-        resized, top, pad_h - top, left, pad_w - left,
-        cv2.BORDER_CONSTANT, value=(114, 114, 114),
-    )
-    return padded, scale, (top, left)
-
-
-def _nms(
-    boxes: np.ndarray, scores: np.ndarray, iou_thresh: float,
-) -> List[int]:
-    """Greedy NMS; returns surviving indices sorted by descending score."""
-    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    areas = (x2 - x1) * (y2 - y1)
-    order = scores.argsort()[::-1]
-    keep: List[int] = []
-    while order.size > 0:
-        i = int(order[0])
-        keep.append(i)
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-        inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
-        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-        order = order[1:][iou <= iou_thresh]
-    return keep
+    if max(h, w) > MAX_INFER_SIZE:
+        scale = MAX_INFER_SIZE / max(h, w)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)),
+                         interpolation=cv2.INTER_AREA)
+    return img
 
 
 def run_inference(
@@ -302,76 +195,46 @@ def run_inference(
     iou: float,
 ) -> Tuple[np.ndarray, List[Dict[str, Any]], float]:
     """
-    Run YOLOv8n ONNX inference on a BGR image.
+    Run YOLOv8 inference on a BGR image.
 
     Returns:
         (annotated_image, list_of_dets, inference_ms)
     """
-    orig_h, orig_w = image.shape[:2]
+    image = _resize_for_inference(image)
 
-    # ── Preprocess: letterbox → RGB → NCHW float32 ──────────────────────────
-    padded, scale, (pad_top, pad_left) = _letterbox(image)
-    rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    inp = rgb.transpose(2, 0, 1)[np.newaxis]          # [1, 3, 640, 640]
-
-    # ── Forward pass ─────────────────────────────────────────────────────────
     t0 = time.perf_counter()
-    raw = model.run(None, {model.get_inputs()[0].name: inp})[0]  # [1, 84, 8400]
+    results = model.predict(image, conf=conf, iou=iou, device="cpu", verbose=False)
     inf_ms = (time.perf_counter() - t0) * 1000
-
-    pred = raw[0].T                                   # [8400, 84]
-    cx, cy, bw, bh = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
-    class_scores = pred[:, 4:]                        # [8400, 80]
-
-    # cx,cy,w,h → x1,y1,x2,y2 in padded-image coords
-    bx1, by1 = cx - bw / 2, cy - bh / 2
-    bx2, by2 = cx + bw / 2, cy + bh / 2
 
     detections: List[Dict[str, Any]] = []
     annotated = image.copy()
-    coco_keys = list(COCO_AUTOMOTIVE.keys())
 
-    # ── Per-class NMS over automotive COCO classes ────────────────────────────
-    for coco_id, cls_name in COCO_AUTOMOTIVE.items():
-        if coco_id >= class_scores.shape[1]:
+    for result in results:
+        if result.boxes is None:
             continue
-        cls_conf = class_scores[:, coco_id]
-        mask = cls_conf >= conf
-        if not mask.any():
-            continue
+        for box in result.boxes:
+            cls_id   = int(box.cls.item())
+            conf_val = float(box.conf.item())
+            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
 
-        boxes_m  = np.stack([bx1[mask], by1[mask], bx2[mask], by2[mask]], axis=1)
-        scores_m = cls_conf[mask]
-        keep     = _nms(boxes_m, scores_m, iou)
+            cls_name = result.names.get(cls_id, str(cls_id)) if result.names else str(cls_id)
+            color    = CLASS_COLORS_BGR[cls_id % len(CLASS_COLORS_BGR)]
 
-        display_idx = coco_keys.index(coco_id)
-        color = CLASS_COLORS_BGR[display_idx % len(CLASS_COLORS_BGR)]
-
-        for k in keep:
-            # Unscale from padded coords back to original image coords
-            ix1 = max(0, int((boxes_m[k, 0] - pad_left) / scale))
-            iy1 = max(0, int((boxes_m[k, 1] - pad_top)  / scale))
-            ix2 = min(orig_w, int((boxes_m[k, 2] - pad_left) / scale))
-            iy2 = min(orig_h, int((boxes_m[k, 3] - pad_top)  / scale))
-            if ix2 <= ix1 or iy2 <= iy1:
-                continue
-
-            conf_val = float(scores_m[k])
-            cv2.rectangle(annotated, (ix1, iy1), (ix2, iy2), color, 2)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
             label = f"{cls_name}  {conf_val:.2f}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-            cv2.rectangle(annotated, (ix1, iy1 - th - 6), (ix1 + tw + 4, iy1), color, -1)
-            cv2.putText(annotated, label, (ix1 + 2, iy1 - 3),
+            cv2.rectangle(annotated, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
+            cv2.putText(annotated, label, (x1 + 2, y1 - 3),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
             detections.append({
-                "class_id":   display_idx,
+                "class_id":   cls_id,
                 "class_name": cls_name,
                 "confidence": round(conf_val, 4),
-                "bbox":       [ix1, iy1, ix2, iy2],
+                "bbox":       [x1, y1, x2, y2],
             })
 
-    del raw, pred
+    del results
     gc.collect()
 
     return annotated, detections, inf_ms
@@ -400,9 +263,8 @@ def render_sidebar() -> Dict[str, Any]:
         # ── Model Settings ────────────────────────────────────────────────────
         st.markdown("### ⚙️ Model Settings")
 
-        weights_path = str(ONNX_MODEL)
-        st.caption("📂 `yolov8n.onnx`")
-        st.info("💻 Inference via **ONNX Runtime** (CPU, ~40 MB)", icon="ℹ️")
+        st.caption("📂 `yolov8n.pt`")
+        st.info("💻 Inference on **CPU** via Ultralytics YOLOv8", icon="ℹ️")
 
         st.divider()
 
@@ -440,14 +302,13 @@ def render_sidebar() -> Dict[str, Any]:
         st.markdown("""
         <div style="color:#6b7280; font-size:0.78rem; text-align:center;">
             <b>Autonomous Obstacle Detection</b><br/>
-            YOLOv8n · ONNX Runtime · OpenCV<br/>
+            YOLOv8n · Ultralytics · OpenCV<br/>
             <a href="https://github.com/pun33th45/autonomous-vehicle-obstacle-detection-yolo"
                style="color:#58a6ff;">GitHub ↗</a>
         </div>
         """, unsafe_allow_html=True)
 
     return {
-        "weights_path":     weights_path,
         "conf_threshold":   conf_threshold,
         "iou_threshold":    iou_threshold,
         "selected_classes": selected_classes,
@@ -1053,20 +914,17 @@ def main() -> None:
     """, unsafe_allow_html=True)
 
     cfg   = render_sidebar()
-    model = load_model(cfg["weights_path"])
+    model = load_model()
 
     if model is not None:
         col_s1, col_s2, col_s3, col_s4 = st.columns(4)
-        col_s1.metric("🤖 Model", Path(cfg["weights_path"]).stem)
+        col_s1.metric("🤖 Model", "YOLOv8n")
         col_s2.metric("🎯 Confidence", f"{cfg['conf_threshold']:.0%}")
         col_s3.metric("📐 IoU Threshold", f"{cfg['iou_threshold']:.0%}")
         col_s4.metric("💻 Device", "CPU")
         st.divider()
     else:
-        st.warning(
-            "⚠️ Model not loaded. Ensure `yolov8n.onnx` is present in the app directory. "
-            "On Render it is baked into the Docker image during the build stage."
-        )
+        st.warning("⚠️ Model failed to load. Check the application logs for details.")
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "🖼️  Image Detection",
@@ -1091,7 +949,7 @@ def main() -> None:
     <hr style="border-color:#21262d; margin:40px 0 10px;"/>
     <div style="text-align:center; color:#6b7280; font-size:0.8rem; padding-bottom:20px;">
         Autonomous Vehicle Obstacle Detection &nbsp;·&nbsp;
-        YOLOv8n &nbsp;·&nbsp; ONNX Runtime &nbsp;·&nbsp; OpenCV &nbsp;·&nbsp; Streamlit<br/>
+        YOLOv8n &nbsp;·&nbsp; Ultralytics &nbsp;·&nbsp; OpenCV &nbsp;·&nbsp; Streamlit<br/>
         <a href="https://github.com/pun33th45/autonomous-vehicle-obstacle-detection-yolo"
            style="color:#58a6ff;">⭐ GitHub Repository</a>
     </div>
