@@ -996,6 +996,18 @@ def main() -> None:
     """, unsafe_allow_html=True)
 
     cfg   = render_sidebar()
+
+    # Pre-flight: confirm ONNX file exists before attempting to load
+    onnx_path = Path(cfg["weights_path"])
+    if not onnx_path.exists():
+        st.error(
+            f"❌ ONNX model not found at `{onnx_path}`. "
+            "On Render this file is baked into the Docker image by the multi-stage build. "
+            "If running locally, export it with: "
+            "`python -c \"from ultralytics import YOLO; YOLO('yolov8n.pt').export(format='onnx')\"`"
+        )
+        st.stop()
+
     model = load_model(cfg["weights_path"])
 
     if model is not None:
