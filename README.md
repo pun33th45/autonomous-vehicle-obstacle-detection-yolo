@@ -8,10 +8,6 @@
 [![HF Spaces](https://img.shields.io/badge/Deployed-HuggingFace_Spaces-FFD21E?style=flat-square&logo=huggingface&logoColor=black)](https://huggingface.co/spaces)
 [![License](https://img.shields.io/badge/License-MIT-22c55e?style=flat-square)](LICENSE)
 
-<img src="docs/demo.gif" alt="Dashboard demo — upload image, see bounding-box detections" width="100%" />
-
-> **TODO:** Record a screen-capture of the Image Detection tab in action and save to `docs/demo.gif`.
-
 ---
 
 ## What it does
